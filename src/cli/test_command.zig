@@ -934,6 +934,93 @@ pub const CommandLineReporter = struct {
         Output.printStartEnd(bun.start_time, std.time.nanoTimestamp());
     }
 
+    pub fn scanAllSourceFiles(this: *CommandLineReporter, vm: *jsc.VirtualMachine, opts: *TestCommand.CodeCoverageOptions) !std.ArrayList([]const u8) {
+        var all_files = std.ArrayList([]const u8).init(bun.default_allocator);
+        
+        const top_level_dir = vm.transpiler.fs.top_level_dir;
+        try this.scanDirectoryForSourceFiles(top_level_dir, &all_files, opts, vm);
+        
+        return all_files;
+    }
+
+    fn scanDirectoryForSourceFiles(this: *CommandLineReporter, dir_path: []const u8, all_files: *std.ArrayList([]const u8), opts: *TestCommand.CodeCoverageOptions, vm: *jsc.VirtualMachine) !void {
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+        
+        var iterator = dir.iterate();
+        while (try iterator.next()) |entry| {
+            const full_path = try bun.path.joinAbsString(bun.default_allocator, &.{ dir_path, entry.name }, .auto);
+            defer bun.default_allocator.free(full_path);
+            
+            switch (entry.kind) {
+                .directory => {
+                    // Skip node_modules and other common directories
+                    if (bun.strings.eqlComptime(entry.name, "node_modules") or
+                        bun.strings.eqlComptime(entry.name, ".git") or
+                        bun.strings.eqlComptime(entry.name, ".next") or
+                        bun.strings.eqlComptime(entry.name, "dist") or
+                        bun.strings.eqlComptime(entry.name, "build") or
+                        bun.strings.startsWith(entry.name, "."))
+                    {
+                        continue;
+                    }
+                    
+                    try this.scanDirectoryForSourceFiles(full_path, all_files, opts, vm);
+                },
+                .file => {
+                    if (this.isSourceFile(entry.name, opts)) {
+                        const relative_path = bun.path.relative(vm.transpiler.fs.top_level_dir, full_path);
+                        
+                        // Check if this file should be ignored based on coveragePathIgnorePatterns
+                        var should_ignore = false;
+                        if (opts.ignore_patterns.len > 0) {
+                            for (opts.ignore_patterns) |pattern| {
+                                if (bun.glob.match(bun.default_allocator, pattern, relative_path).matches()) {
+                                    should_ignore = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (!should_ignore) {
+                            try all_files.append(try bun.default_allocator.dupe(u8, full_path));
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn isSourceFile(this: *CommandLineReporter, name: []const u8, opts: *TestCommand.CodeCoverageOptions) bool {
+        _ = this;
+        
+        const extname = std.fs.path.extension(name);
+        if (extname.len == 0) return false;
+        
+        // Check if it's a JavaScript-like file
+        const is_js_like = bun.strings.eqlComptime(extname, ".js") or
+            bun.strings.eqlComptime(extname, ".jsx") or
+            bun.strings.eqlComptime(extname, ".ts") or
+            bun.strings.eqlComptime(extname, ".tsx") or
+            bun.strings.eqlComptime(extname, ".mjs") or
+            bun.strings.eqlComptime(extname, ".cjs");
+            
+        if (!is_js_like) return false;
+        
+        // Skip test files if configured to do so
+        if (opts.skip_test_files) {
+            const name_without_extension = name[0 .. name.len - extname.len];
+            inline for (Scanner.test_name_suffixes) |suffix| {
+                if (bun.strings.endsWithComptime(name_without_extension, suffix)) {
+                    return false;
+                }
+            }
+        }
+        
+        return true;
+    }
+
     pub fn generateCodeCoverage(this: *CommandLineReporter, vm: *jsc.VirtualMachine, opts: *TestCommand.CodeCoverageOptions, comptime reporters: TestCommand.Reporters, comptime enable_ansi_colors: bool) !void {
         if (comptime !reporters.text and !reporters.lcov) {
             return;
@@ -945,6 +1032,48 @@ pub const CommandLineReporter = struct {
 
         while (iter.next()) |entry| {
             byte_ranges.appendAssumeCapacity(entry.*);
+        }
+
+        // Scan for all JavaScript/TypeScript files to include untested files
+        var all_files = try this.scanAllSourceFiles(vm, opts);
+        defer {
+            for (all_files.items) |file_path| {
+                bun.default_allocator.free(file_path);
+            }
+            all_files.deinit();
+        }
+
+        // Add untested files to byte_ranges with empty coverage
+        for (all_files.items) |file_path| {
+            const file_hash = bun.hash(file_path);
+            if (map.getPtr(file_hash) == null) {
+                // This file has no coverage data, create an empty entry
+                var source_url = bun.jsc.ZigString.Slice.fromUTF8NeverFree(file_path);
+                
+                // Read the file to generate proper line offset table
+                if (bun.sys.File.readFrom(std.fs.cwd(), file_path, bun.default_allocator)) |result| {
+                    switch (result) {
+                        .result => |contents| {
+                            defer bun.default_allocator.free(contents);
+                            var empty_mapping = coverage.ByteRangeMapping{
+                                .line_offset_table = bun.sourcemap.LineOffsetTable.generate(bun.default_allocator, contents, 0),
+                                .source_id = -1,
+                                .source_url = source_url,
+                            };
+                            try byte_ranges.append(empty_mapping);
+                        },
+                        .err => {},
+                    }
+                } else |_| {
+                    // If we can't read the file, create a minimal empty mapping
+                    var empty_mapping = coverage.ByteRangeMapping{
+                        .line_offset_table = bun.sourcemap.LineOffsetTable.generate(bun.default_allocator, "", 0),
+                        .source_id = -1,
+                        .source_url = source_url,
+                    };
+                    try byte_ranges.append(empty_mapping);
+                }
+            }
         }
 
         if (byte_ranges.items.len == 0) {
@@ -1128,7 +1257,22 @@ pub const CommandLineReporter = struct {
                 }
             }
 
-            var report = CodeCoverageReport.generate(vm.global, bun.default_allocator, entry, opts.ignore_sourcemap) orelse continue;
+            var report = CodeCoverageReport.generate(vm.global, bun.default_allocator, entry, opts.ignore_sourcemap) orelse blk: {
+                // If generate returns null, this might be an untested file
+                // Try to create an empty report
+                const utf8 = entry.source_url.slice();
+                if (bun.sys.File.readFrom(std.fs.cwd(), utf8, bun.default_allocator)) |result| {
+                    switch (result) {
+                        .result => |contents| {
+                            defer bun.default_allocator.free(contents);
+                            break :blk CodeCoverageReport.generateEmptyReport(bun.default_allocator, entry.source_url, contents) catch continue;
+                        },
+                        .err => continue,
+                    }
+                } else |_| {
+                    continue;
+                }
+            };
             defer report.deinit(bun.default_allocator);
 
             if (comptime reporters.text) {

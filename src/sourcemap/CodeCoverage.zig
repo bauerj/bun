@@ -404,6 +404,60 @@ pub const ByteRangeMapping = struct {
         return entry;
     }
 
+    pub fn generateEmptyReport(
+        allocator: std.mem.Allocator,
+        source_url: bun.jsc.ZigString.Slice,
+        source_contents: []const u8,
+    ) !Report {
+        const line_offset_table = bun.sourcemap.LineOffsetTable.generate(allocator, source_contents, 0);
+        const line_count: u32 = @truncate(line_offset_table.items(.byte_offset_to_start_of_line).len);
+        
+        var executable_lines = try Bitset.initEmpty(allocator, line_count);
+        var lines_which_have_executed = try Bitset.initEmpty(allocator, line_count);
+        var line_hits = try LinesHits.initCapacity(allocator, line_count);
+        line_hits.len = line_count;
+        @memset(line_hits.slice(), 0);
+        
+        var functions = std.ArrayListUnmanaged(Block){};
+        var functions_which_have_executed = try Bitset.initEmpty(allocator, 0);
+        var stmts_which_have_executed = try Bitset.initEmpty(allocator, 0);
+        var stmts = std.ArrayListUnmanaged(Block){};
+        
+        // Mark all non-empty lines as executable but not executed
+        const line_starts = line_offset_table.items(.byte_offset_to_start_of_line);
+        for (0..line_count) |i| {
+            const line_start = if (i < line_starts.len) line_starts[i] else source_contents.len;
+            const line_end = if (i + 1 < line_starts.len) line_starts[i + 1] else source_contents.len;
+            
+            if (line_start < source_contents.len and line_end > line_start) {
+                const line_content = source_contents[line_start..@min(line_end, source_contents.len)];
+                // Check if line has any non-whitespace content
+                var has_content = false;
+                for (line_content) |char| {
+                    if (char != ' ' and char != '\t' and char != '\n' and char != '\r') {
+                        has_content = true;
+                        break;
+                    }
+                }
+                if (has_content) {
+                    executable_lines.set(@intCast(i));
+                }
+            }
+        }
+        
+        return .{
+            .source_url = source_url,
+            .functions = functions,
+            .executable_lines = executable_lines,
+            .lines_which_have_executed = lines_which_have_executed,
+            .line_hits = line_hits,
+            .total_lines = line_count,
+            .stmts = stmts,
+            .functions_which_have_executed = functions_which_have_executed,
+            .stmts_which_have_executed = stmts_which_have_executed,
+        };
+    }
+
     pub fn generateReportFromBlocks(
         this: *ByteRangeMapping,
         allocator: std.mem.Allocator,
